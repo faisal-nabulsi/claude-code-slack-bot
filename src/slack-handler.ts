@@ -282,13 +282,16 @@ export class SlackHandler {
               await this.handleTodoUpdate(todoTool.input, sessionKey, session?.sessionId, channel, thread_ts || ts, say);
             }
 
-            // For other tool use messages, format them immediately as new messages
+            // Tool-use details are logged, not posted — keeps the channel readable.
+            // Set VERBOSE_TOOLS=true in .env to restore per-tool Slack messages.
             const toolContent = this.formatToolUse(message.message.content);
-            if (toolContent) { // Only send if there's content (TodoWrite returns empty string)
+            if (toolContent && process.env.VERBOSE_TOOLS === 'true') {
               await say({
                 text: toolContent,
                 thread_ts: thread_ts || ts,
               });
+            } else if (toolContent) {
+              this.logger.debug('Tool use (suppressed from Slack)', { toolContent: toolContent.substring(0, 200) });
             }
           } else {
             // Handle regular text content
