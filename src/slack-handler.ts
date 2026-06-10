@@ -576,7 +576,19 @@ export class SlackHandler {
     }
   }
 
+  private static EMOJI_NAMES: Record<string, string> = {
+    '🤔': 'thinking_face',
+    '⚙️': 'gear',
+    '✅': 'white_check_mark',
+    '❌': 'x',
+    '⏹️': 'black_square_for_stop',
+    '🔄': 'arrows_counterclockwise',
+    '📋': 'clipboard',
+  };
+
   private async updateMessageReaction(sessionKey: string, emoji: string): Promise<void> {
+    // Slack's reactions API takes emoji NAMES (e.g. 'gear'), not unicode chars.
+    emoji = SlackHandler.EMOJI_NAMES[emoji] || emoji;
     const originalMessage = this.originalMessages.get(sessionKey);
     if (!originalMessage) {
       return;
