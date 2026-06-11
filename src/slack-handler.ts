@@ -732,11 +732,34 @@ export class SlackHandler {
     return formatted;
   }
 
+  private humanUserCache: Map<string, boolean> = new Map();
+
+  // True when userId is a real workspace human (not a bot user). Messages posted
+  // via a user token (xoxp) carry BOTH a human `user` and a `bot_id`; the human
+  // author is what makes them human-authorized, so they count as human turns
+  // (full tools) instead of read-only bot-to-bot turns.
+  private async isHumanAuthor(userId: string | undefined): Promise<boolean> {
+    if (!userId || userId === 'USLACKBOT') return false;
+    const cached = this.humanUserCache.get(userId);
+    if (cached !== undefined) return cached;
+    let human = false;
+    try {
+      const res = await this.app.client.users.info({ user: userId });
+      human = !!res.user && !(res.user as any).is_bot;
+    } catch {
+      human = false; // can't verify -> treat as bot (fail safe)
+    }
+    this.humanUserCache.set(userId, human);
+    return human;
+  }
+
   setupEventHandlers() {
     // Handle direct messages
     this.app.message(async ({ message, say }) => {
-      // Ignore anything from a bot (prevents bots triggering each other / loops)
-      if ((message as any).bot_id || (message as any).subtype === 'bot_message') {
+      // Ignore anything from a bot (prevents bots triggering each other / loops),
+      // UNLESS the author is a real human posting via a user token (xoxp).
+      if (((message as any).bot_id || (message as any).subtype === 'bot_message')
+          && !(await this.isHumanAuthor((message as any).user))) {
         return;
       }
       // Only auto-respond in DMs. In channels, require an @mention (handled below).
@@ -754,7 +777,10 @@ export class SlackHandler {
       const rawText = (event as any).text as string | undefined;
 
       // Bounded bot-to-bot: inspect inbound for bot-author + hop count.
-      const chain = inspectInbound(botId, rawText);
+      // A human posting through a user token (xoxp) has a bot_id but a human
+      // `user` -> treat as a human turn (full tools, hop counter reset).
+      const authorIsHuman = await this.isHumanAuthor((event as any).user);
+      const chain = inspectInbound(authorIsHuman ? undefined : botId, rawText);
 
       // Hard stop: if the inbound already passed the limit, do not respond at all.
       if (chain.isFromBot && chain.hop >= MAX_HOPS) {

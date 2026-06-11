@@ -3,6 +3,16 @@ import { ConversationSession } from './types';
 import { Logger } from './logger';
 import { McpManager, McpServerConfig } from './mcp-manager';
 import { applyReadOnlyForBotTurn } from './agent-chat-guard';
+import * as fs from 'fs';
+
+// Per-bot persona — appended to the system prompt. Set PERSONA_FILE in .env
+// to a markdown file; absent/unreadable -> stock prompt (no persona).
+const BOT_PERSONA = (() => {
+  const personaPath = process.env.PERSONA_FILE || '';
+  if (!personaPath) return '';
+  try { return fs.readFileSync(personaPath, 'utf8'); }
+  catch { return ''; }
+})();
 
 export class ClaudeHandler {
   private sessions: Map<string, ConversationSession> = new Map();
@@ -44,6 +54,7 @@ export class ClaudeHandler {
     const options: any = {
       outputFormat: 'stream-json',
       permissionMode: 'bypassPermissions',
+      systemPrompt: { type: 'preset', preset: 'claude_code', append: BOT_PERSONA },
     };
 
     // Add permission prompt tool if we have Slack context
