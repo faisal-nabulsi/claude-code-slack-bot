@@ -3,6 +3,16 @@ import { ConversationSession } from './types';
 import { Logger } from './logger';
 import { McpManager, McpServerConfig } from './mcp-manager';
 import { applyReadOnlyForBotTurn } from './agent-chat-guard';
+import * as fs from 'fs';
+
+// Per-bot persona, appended to the system prompt. Set PERSONA_FILE in each bot's .env
+// to its own persona .md (e.g. kathryne_persona.md). Unset/missing = generic Claude Code.
+const PERSONA = (() => {
+  const p = process.env.PERSONA_FILE;
+  if (!p) return '';
+  try { return fs.readFileSync(p, 'utf8'); }
+  catch { return ''; }
+})();
 
 export class ClaudeHandler {
   private sessions: Map<string, ConversationSession> = new Map();
@@ -44,6 +54,8 @@ export class ClaudeHandler {
     const options: any = {
       outputFormat: 'stream-json',
       permissionMode: 'bypassPermissions',
+      // append (not replace) the persona so the bot stays in-character AND keeps Claude Code's tools
+      systemPrompt: { type: 'preset', preset: 'claude_code', append: PERSONA },
     };
 
     // Add permission prompt tool if we have Slack context
