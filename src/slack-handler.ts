@@ -10,6 +10,24 @@ import { permissionServer } from './permission-mcp-server';
 import { config } from './config';
 import { inspectInbound, applyReadOnlyForBotTurn, stampOutgoing, MAX_HOPS } from './agent-chat-guard';
 
+// Known CalibrateRL agent bots: Slack user ID -> @name. Bot-to-bot detection
+// (read-only turn + hop counter) keys on event.bot_id, which any bot-authored
+// event carries; this list additionally (a) treats events authored by these
+// users as bot turns even if bot_id is missing, and (b) drives the hop-limit
+// mention strip so a chain can't be extended by @naming another agent.
+const AGENT_BOTS: Record<string, string> = {
+  U0B9C278VPW: 'gilbert',
+  U0BA8P14L5N: 'kathryne',
+  U0B9CFA6KFY: 'charizard',
+  U0B9X82Q5FX: 'trainaws', // L40S training executor ("@awesome-ash" in some docs)
+  U0B9Y47N1EH: 'sam', // L4 sampling executor
+  U0B9L2MEKUP: 'sadie', // L4 sampling executor
+};
+const AGENT_BOT_MENTION_RE = new RegExp(
+  `<@[A-Z0-9]+>|@(${Object.values(AGENT_BOTS).join('|')})\\b`,
+  'gi'
+);
+
 interface MessageEvent {
   user: string;
   channel: string;
@@ -318,8 +336,7 @@ export class SlackHandler {
           if (message.subtype === 'success' && (message as any).result) {
             const finalResult = (message as any).result;
             if (finalResult && !currentMessages.includes(finalResult)) {
-              const botMentionRe = /<@[A-Z0-9]+>|@(gilbert|kathryne|charizard)\b/gi;
-              const stamped = stampOutgoing(finalResult, chain, botMentionRe);
+              const stamped = stampOutgoing(finalResult, chain, AGENT_BOT_MENTION_RE);
               const formatted = this.formatMessage(stamped, true);
               await say({
                 text: formatted,
@@ -776,11 +793,16 @@ export class SlackHandler {
       const botId = (event as any).bot_id as string | undefined;
       const rawText = (event as any).text as string | undefined;
 
-      // Bounded bot-to-bot: inspect inbound for bot-author + hop count.
-      // A human posting through a user token (xoxp) has a bot_id but a human
-      // `user` -> treat as a human turn (full tools, hop counter reset).
-      const authorIsHuman = await this.isHumanAuthor((event as any).user);
-      const chain = inspectInbound(authorIsHuman ? undefined : botId, rawText);
+      // Bounded bot-to-bot: inspect inbound for bot-author + hop count. A known
+      // agent author counts as a bot even if the event lacks a bot_id (or looks
+      // human to users.info). A human posting through a user token (xoxp) has a
+      // bot_id but a human `user` -> treat as a human turn (full tools, hop
+      // counter reset).
+      const authorId = (event as any).user as string | undefined;
+      const isKnownAgent = !!(authorId && AGENT_BOTS[authorId]);
+      const effectiveBotId = botId || (isKnownAgent ? authorId : undefined);
+      const authorIsHuman = !isKnownAgent && await this.isHumanAuthor(authorId);
+      const chain = inspectInbound(authorIsHuman ? undefined : effectiveBotId, rawText);
 
       // Hard stop: if the inbound already passed the limit, do not respond at all.
       if (chain.isFromBot && chain.hop >= MAX_HOPS) {
