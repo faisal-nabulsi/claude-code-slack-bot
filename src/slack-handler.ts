@@ -789,16 +789,15 @@ export class SlackHandler {
     return true;
   }
 
-  // Addressing rule: a message is FOR this bot only when this bot is the first
-  // user mentioned in it. A mention later in the text ("... cc <@me>",
-  // "ask <@me> about X") is referential — with six agents in one channel,
-  // answering those makes every referenced bot pile into the thread. This holds
-  // in threads too: app_mention fires for any mention anywhere, so a thread
-  // reply that merely names another agent must not drag that agent in.
+  // Addressing rule: a message is FOR this bot when it mentions this bot
+  // anywhere in the text. First-mention-wins was tried and silently dropped
+  // the later addressees in multi-task messages ("<@a> do X and <@b> do Y").
+  // The cost is that purely referential mentions ("ask <@me> about X") also
+  // trigger a reply — accepted residual risk: the read-only bot-turn guard
+  // and the hop cap bound any resulting pileup.
   private isAddressedToMe(text: string | undefined, botUserId: string): boolean {
     if (!text) return false;
-    const firstMention = text.match(/<@([A-Z0-9]+)>/);
-    return !!firstMention && firstMention[1] === botUserId;
+    return text.includes(`<@${botUserId}>`);
   }
 
   private humanUserCache: Map<string, boolean> = new Map();
@@ -847,11 +846,11 @@ export class SlackHandler {
       const botId = (event as any).bot_id as string | undefined;
       const rawText = (event as any).text as string | undefined;
 
-      // Only act when this bot is the one being addressed (first mention in the
-      // message) — not merely referenced mid-text.
+      // Only act when this bot is mentioned somewhere in the message text.
+      // (app_mention can also fire on e.g. mentions inside attachments.)
       const myUserId = await this.getBotUserId();
       if (myUserId && !this.isAddressedToMe(rawText, myUserId)) {
-        this.logger.info('Mention is referential, not addressed to me; ignoring', {
+        this.logger.info('Mention not in message text, not addressed to me; ignoring', {
           ts: (event as any).ts,
         });
         return;
