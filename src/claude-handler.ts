@@ -2,7 +2,7 @@ import { query, type SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import { ConversationSession } from './types';
 import { Logger } from './logger';
 import { McpManager, McpServerConfig } from './mcp-manager';
-import { applyReadOnlyForBotTurn } from './agent-chat-guard';
+import { applyReadOnlyForBotTurn, ChainInfo } from './agent-chat-guard';
 import * as fs from 'fs';
 
 // Per-bot persona — appended to the system prompt. Set PERSONA_FILE in .env
@@ -49,7 +49,7 @@ export class ClaudeHandler {
     abortController?: AbortController,
     workingDirectory?: string,
     slackContext?: { channel: string; threadTs?: string; user: string },
-    chain?: { isFromBot: boolean; hop: number; atLimit: boolean }
+    chain?: ChainInfo
   ): AsyncGenerator<SDKMessage, void, unknown> {
     const options: any = {
       outputFormat: 'stream-json',
