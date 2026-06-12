@@ -39,6 +39,13 @@ export const READONLY_ALLOWED_TOOLS = [
   'mcp__slack__slack_list_channels',
   'mcp__slack__slack_get_user_profile',
   'mcp__slack__slack_get_users',
+  // Reporting is not execution: a bot on a read-only turn must still be able
+  // to SAY what it found (2026-06-12: kathryne diagnosed a failed handoff on a
+  // monitor turn but her warning was permission-blocked — the channel only
+  // learned of it a turn later). Files/shell/AWS stay locked out.
+  'mcp__slack__slack_post_message',
+  'mcp__slack__slack_reply_to_thread',
+  'mcp__slack__slack_add_reaction',
 ];
 
 // Denied on EVERY bot-initiated turn, even human-rooted ones: starting/stopping
