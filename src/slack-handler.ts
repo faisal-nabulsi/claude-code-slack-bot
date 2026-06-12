@@ -19,7 +19,7 @@ const AGENT_BOTS: Record<string, string> = {
   U0B9C278VPW: 'gilbert',
   U0BA8P14L5N: 'kathryne',
   U0B9CFA6KFY: 'charizard',
-  U0B9X82Q5FX: 'trainaws', // L40S training executor ("@awesome-ash" in some docs)
+  U0B9X82Q5FX: 'awesome-ash', // L40S training executor (formerly 'trainaws')
   U0B9Y47N1EH: 'sam', // L4 sampling executor
   U0B9L2MEKUP: 'sadie', // L4 sampling executor
 };
@@ -27,6 +27,18 @@ const AGENT_BOT_MENTION_RE = new RegExp(
   `<@[A-Z0-9]+>|@(${Object.values(AGENT_BOTS).join('|')})\\b`,
   'gi'
 );
+// NON-global on purpose: .test() on a /g regex is stateful (lastIndex). Used to
+// detect "this reply @mentions a known agent" => a human turn starts a chain.
+const AGENT_USER_MENTION_RE = new RegExp(
+  `<@(${Object.keys(AGENT_BOTS).join('|')})>`,
+  'i'
+);
+
+// Turn timeout: abort any task running past this and say so in the status
+// message, instead of holding the session open forever.
+const MAX_TURN_SECONDS = parseInt(process.env.MAX_TURN_SECONDS || '1200', 10);
+export const TIMEOUT_STATUS = ':stopwatch: timed out — re-ask or split';
+export const INTERRUPTED_STATUS = ':black_square_for_stop: interrupted';
 
 // Stale-event guard: Slack redelivers events (retry after a slow ack — our turns
 // run minutes; replay of queued events after a socket reconnect). Without this,
@@ -65,6 +77,7 @@ export class SlackHandler {
   private mcpManager: McpManager;
   private todoMessages: Map<string, string> = new Map(); // sessionKey -> messageTs
   private originalMessages: Map<string, { channel: string; ts: string }> = new Map(); // sessionKey -> original message info
+  private statusMessages: Map<string, { channel: string; ts: string }> = new Map(); // sessionKey -> in-flight status message (for SIGTERM)
   private currentReactions: Map<string, string> = new Map(); // sessionKey -> current emoji
   private botUserId: string | null = null;
 
@@ -231,6 +244,14 @@ export class SlackHandler {
     const abortController = new AbortController();
     this.activeControllers.set(sessionKey, abortController);
 
+    // Turn timeout: a runaway turn is aborted and reported, not left spinning.
+    let turnTimedOut = false;
+    const turnTimer = setTimeout(() => {
+      turnTimedOut = true;
+      this.logger.warn('Turn exceeded MAX_TURN_SECONDS, aborting', { sessionKey, MAX_TURN_SECONDS });
+      abortController.abort();
+    }, MAX_TURN_SECONDS * 1000);
+
     let session = this.claudeHandler.getSession(user, channel, thread_ts || ts);
     if (!session) {
       this.logger.debug('Creating new session', { sessionKey });
@@ -261,6 +282,9 @@ export class SlackHandler {
         thread_ts: thread_ts || ts,
       });
       statusMessageTs = statusResult.ts;
+      if (statusMessageTs) {
+        this.statusMessages.set(sessionKey, { channel, ts: statusMessageTs });
+      }
 
       // Add thinking reaction to original message (but don't spam if already set)
       await this.updateMessageReaction(sessionKey, '🤔');
@@ -345,7 +369,11 @@ export class SlackHandler {
           if (message.subtype === 'success' && (message as any).result) {
             const finalResult = (message as any).result;
             if (finalResult && !currentMessages.includes(finalResult)) {
-              const stamped = stampOutgoing(finalResult, chain, AGENT_BOT_MENTION_RE);
+              const stamped = stampOutgoing(finalResult, chain, {
+                stripRe: AGENT_BOT_MENTION_RE,
+                agentRe: AGENT_USER_MENTION_RE,
+                rootTs: ts, // a human turn that @mentions an agent roots a chain here
+              });
               const formatted = this.formatMessage(stamped, true);
               await say({
                 text: formatted,
@@ -356,22 +384,29 @@ export class SlackHandler {
         }
       }
 
-      // Update status to completed
-      if (statusMessageTs) {
-        await this.app.client.chat.update({
-          channel,
-          ts: statusMessageTs,
-          text: '✅ *Task completed*',
+      // The stream loop exits without throwing when the controller aborts
+      // (timeout, or a newer message for the same session) — don't report that
+      // as success.
+      if (abortController.signal.aborted) {
+        await this.finishAbortedTurn(sessionKey, statusMessageTs, channel, turnTimedOut);
+      } else {
+        // Update status to completed
+        if (statusMessageTs) {
+          await this.app.client.chat.update({
+            channel,
+            ts: statusMessageTs,
+            text: '✅ *Task completed*',
+          });
+        }
+
+        // Update reaction to show completion
+        await this.updateMessageReaction(sessionKey, '✅');
+
+        this.logger.info('Completed processing message', {
+          sessionKey,
+          messageCount: currentMessages.length,
         });
       }
-
-      // Update reaction to show completion
-      await this.updateMessageReaction(sessionKey, '✅');
-
-      this.logger.info('Completed processing message', {
-        sessionKey,
-        messageCount: currentMessages.length,
-      });
 
       // Clean up temporary files
       if (processedFiles.length > 0) {
@@ -398,19 +433,8 @@ export class SlackHandler {
           thread_ts: thread_ts || ts,
         });
       } else {
-        this.logger.debug('Request was aborted', { sessionKey });
-        
-        // Update status to cancelled
-        if (statusMessageTs) {
-          await this.app.client.chat.update({
-            channel,
-            ts: statusMessageTs,
-            text: '⏹️ *Cancelled*',
-          });
-        }
-
-        // Update reaction to show cancellation
-        await this.updateMessageReaction(sessionKey, '⏹️');
+        this.logger.debug('Request was aborted', { sessionKey, turnTimedOut });
+        await this.finishAbortedTurn(sessionKey, statusMessageTs, channel, turnTimedOut);
       }
 
       // Clean up temporary files in case of error too
@@ -418,8 +442,10 @@ export class SlackHandler {
         await this.fileHandler.cleanupTempFiles(processedFiles);
       }
     } finally {
+      clearTimeout(turnTimer);
       this.activeControllers.delete(sessionKey);
-      
+      this.statusMessages.delete(sessionKey);
+
       // Clean up todo tracking if session ended
       if (session?.sessionId) {
         // Don't immediately clean up - keep todos visible for a while
@@ -430,6 +456,82 @@ export class SlackHandler {
           this.currentReactions.delete(sessionKey);
         }, 5 * 60 * 1000); // 5 minutes
       }
+    }
+  }
+
+  // Report an aborted turn: timeout gets its own status so the asker knows to
+  // re-ask or split; everything else is a plain cancellation.
+  private async finishAbortedTurn(
+    sessionKey: string,
+    statusMessageTs: string | undefined,
+    channel: string,
+    timedOut: boolean
+  ): Promise<void> {
+    const text = timedOut ? TIMEOUT_STATUS : '⏹️ *Cancelled*';
+    if (statusMessageTs) {
+      try {
+        await this.app.client.chat.update({ channel, ts: statusMessageTs, text });
+      } catch (error) {
+        this.logger.warn('Failed to update status for aborted turn', error);
+      }
+    }
+    await this.updateMessageReaction(sessionKey, timedOut ? 'stopwatch' : '⏹️');
+  }
+
+  // SIGTERM/SIGINT with tasks in flight (pm2 restart sends SIGINT by default,
+  // plain `kill` sends SIGTERM): mark every in-flight status message as
+  // interrupted so the death isn't silent, then exit. Bounded — Slack gets a
+  // few seconds, not a veto.
+  private async handleShutdownSignal(signal: string): Promise<void> {
+    const inFlight = [...this.activeControllers.keys()];
+    this.logger.warn(`${signal} received`, { tasksInFlight: inFlight.length });
+    const edits = inFlight.map(async (sessionKey) => {
+      const status = this.statusMessages.get(sessionKey);
+      if (status) {
+        await this.app.client.chat.update({
+          channel: status.channel,
+          ts: status.ts,
+          text: INTERRUPTED_STATUS,
+        });
+      }
+    });
+    for (const controller of this.activeControllers.values()) controller.abort();
+    await Promise.race([
+      Promise.allSettled(edits),
+      new Promise((resolve) => setTimeout(resolve, 4000)),
+    ]);
+    process.exit(0);
+  }
+
+  // PROVENANCE GATE: a chain may do work only if its tagged root message was
+  // authored by a real human. The tag is just a ts — never trusted by itself;
+  // we fetch the message and check the author. Fail-safe: any error, missing
+  // message, or bot author -> false (read-only turn).
+  private async isChainHumanRooted(channel: string, rootTs: string): Promise<boolean> {
+    try {
+      let msg: any;
+      try {
+        // Works for thread replies too: conversations.replies with the reply's
+        // own ts returns that message.
+        const res = await this.app.client.conversations.replies({
+          channel, ts: rootTs, limit: 1, inclusive: true,
+        });
+        msg = (res.messages as any[] | undefined)?.find((m) => m.ts === rootTs);
+      } catch {
+        // fall through to history lookup
+      }
+      if (!msg) {
+        const res = await this.app.client.conversations.history({
+          channel, latest: rootTs, oldest: rootTs, inclusive: true, limit: 1,
+        });
+        msg = (res.messages as any[] | undefined)?.find((m) => m.ts === rootTs);
+      }
+      if (!msg) return false;
+      const author = msg.user as string | undefined;
+      if (!author || AGENT_BOTS[author]) return false;
+      return await this.isHumanAuthor(author);
+    } catch {
+      return false;
     }
   }
 
@@ -822,6 +924,10 @@ export class SlackHandler {
   }
 
   setupEventHandlers() {
+    // Mark in-flight work as interrupted before dying (pm2 restart / kill).
+    process.once('SIGTERM', () => { void this.handleShutdownSignal('SIGTERM'); });
+    process.once('SIGINT', () => { void this.handleShutdownSignal('SIGINT'); });
+
     // Handle direct messages
     this.app.message(async ({ message, say }) => {
       // Ignore anything from a bot (prevents bots triggering each other / loops),
@@ -873,6 +979,18 @@ export class SlackHandler {
       if (chain.isFromBot && chain.hop >= MAX_HOPS) {
         this.logger.info('Bot-to-bot chain at/over limit; ignoring', { hop: chain.hop });
         return;
+      }
+
+      if (chain.isFromBot) {
+        chain.initiatorId = authorId; // @-back: address the reply to the asker
+        if (chain.rootTs) {
+          // Provenance gate: verify (never trust) the tagged root before
+          // granting work permissions on this bot-initiated turn.
+          chain.humanRooted = await this.isChainHumanRooted((event as any).channel, chain.rootTs);
+        }
+        this.logger.info('Bot-to-bot turn', {
+          hop: chain.hop, rootTs: chain.rootTs, humanRooted: chain.humanRooted,
+        });
       }
 
       const text = rawText ? rawText.replace(/<@[^>]+>/g, '').trim() : '';
