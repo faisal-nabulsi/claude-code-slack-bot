@@ -141,6 +141,7 @@ tests.push(test('a human-rooted chain terminates within the hop cap', () => {
 
 function fakeHandler() {
   const updates: any[] = [];
+  let stopped = false;
   const app = {
     client: {
       chat: { update: async (args: any) => { updates.push(args); return { ok: true }; } },
@@ -149,9 +150,10 @@ function fakeHandler() {
         remove: async () => ({ ok: true }),
       },
     },
+    stop: async () => { stopped = true; },
   };
   const handler = new SlackHandler(app as any, {} as any, {} as any);
-  return { handler: handler as any, updates };
+  return { handler: handler as any, updates, wasStopped: () => stopped };
 }
 
 tests.push(test('timeout edits the status message to :stopwatch:', async () => {
@@ -169,7 +171,7 @@ tests.push(test('plain abort (not timeout) stays a cancellation', async () => {
 }));
 
 tests.push(test('SIGTERM edit marks in-flight status as interrupted', async () => {
-  const { handler, updates } = fakeHandler();
+  const { handler, updates, wasStopped } = fakeHandler();
   handler.activeControllers.set('sess-1', new AbortController());
   handler.statusMessages.set('sess-1', { channel: 'C0CHAN', ts: '333.444' });
   const realExit = process.exit;
@@ -183,6 +185,7 @@ tests.push(test('SIGTERM edit marks in-flight status as interrupted', async () =
   assert.ok(exited);
   assert.strictEqual(updates.length, 1);
   assert.strictEqual(updates[0].text, INTERRUPTED_STATUS);
+  assert.ok(wasStopped(), 'Socket Mode connection must be stopped before exit');
 }));
 
 Promise.all(tests).then(() => {

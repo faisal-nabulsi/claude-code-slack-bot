@@ -480,8 +480,10 @@ export class SlackHandler {
 
   // SIGTERM/SIGINT with tasks in flight (pm2 restart sends SIGINT by default,
   // plain `kill` sends SIGTERM): mark every in-flight status message as
-  // interrupted so the death isn't silent, then exit. Bounded — Slack gets a
-  // few seconds, not a veto.
+  // interrupted so the death isn't silent, disconnect Socket Mode cleanly
+  // (a hard death counts against Slack's delivery-failure budget and can get
+  // the app's events disabled), then exit. Bounded — Slack gets a few seconds,
+  // not a veto.
   private async handleShutdownSignal(signal: string): Promise<void> {
     const inFlight = [...this.activeControllers.keys()];
     this.logger.warn(`${signal} received`, { tasksInFlight: inFlight.length });
@@ -500,6 +502,14 @@ export class SlackHandler {
       Promise.allSettled(edits),
       new Promise((resolve) => setTimeout(resolve, 4000)),
     ]);
+    try {
+      await Promise.race([
+        this.app.stop(), // closes the Socket Mode websocket with a proper goodbye
+        new Promise((resolve) => setTimeout(resolve, 3000)),
+      ]);
+    } catch (error) {
+      this.logger.warn('Socket Mode disconnect on shutdown failed', error);
+    }
     process.exit(0);
   }
 
