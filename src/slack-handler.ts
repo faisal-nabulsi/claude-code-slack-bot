@@ -28,6 +28,15 @@ const AGENT_BOT_MENTION_RE = new RegExp(
   'gi'
 );
 
+// Stale-event guard: Slack redelivers events (retry after a slow ack — our turns
+// run minutes; replay of queued events after a socket reconnect). Without this,
+// a bot that was deaf for hours answers every queued mention at once on restart,
+// and a slow turn gets processed 2-3x. Events older than this are dropped.
+const STALE_EVENT_MAX_AGE_SECONDS = parseInt(
+  process.env.STALE_EVENT_MAX_AGE_SECONDS || '600',
+  10
+);
+
 interface MessageEvent {
   user: string;
   channel: string;
@@ -749,6 +758,48 @@ export class SlackHandler {
     return formatted;
   }
 
+  private seenEvents: Map<string, number> = new Map(); // channel:ts -> first-seen ms
+
+  // Drop events that are stale (older than STALE_EVENT_MAX_AGE_SECONDS — e.g.
+  // replayed after a reconnect) or already processed (Slack retries delivery
+  // when the ack is slow, which long Claude turns guarantee). Call this only
+  // once a handler has decided it WOULD process the event, so an event skipped
+  // by one handler doesn't consume the dedupe slot of another.
+  private shouldProcessEvent(event: any, kind: string): boolean {
+    const eventTs = parseFloat(event.event_ts || event.ts || '0');
+    if (eventTs > 0) {
+      const ageSec = Date.now() / 1000 - eventTs;
+      if (ageSec > STALE_EVENT_MAX_AGE_SECONDS) {
+        this.logger.info('Dropping stale event', { kind, ts: event.ts, ageSec: Math.round(ageSec) });
+        return false;
+      }
+    }
+    const key = `${event.channel}:${event.ts}`;
+    if (this.seenEvents.has(key)) {
+      this.logger.info('Dropping duplicate event delivery', { kind, key });
+      return false;
+    }
+    this.seenEvents.set(key, Date.now());
+    if (this.seenEvents.size > 500) {
+      const cutoff = Date.now() - 2 * STALE_EVENT_MAX_AGE_SECONDS * 1000;
+      for (const [k, t] of this.seenEvents) {
+        if (t < cutoff) this.seenEvents.delete(k);
+      }
+    }
+    return true;
+  }
+
+  // Addressing rule: a message is FOR this bot when it mentions this bot
+  // anywhere in the text. First-mention-wins was tried and silently dropped
+  // the later addressees in multi-task messages ("<@a> do X and <@b> do Y").
+  // The cost is that purely referential mentions ("ask <@me> about X") also
+  // trigger a reply — accepted residual risk: the read-only bot-turn guard
+  // and the hop cap bound any resulting pileup.
+  private isAddressedToMe(text: string | undefined, botUserId: string): boolean {
+    if (!text) return false;
+    return text.includes(`<@${botUserId}>`);
+  }
+
   private humanUserCache: Map<string, boolean> = new Map();
 
   // True when userId is a real workspace human (not a bot user). Messages posted
@@ -782,6 +833,7 @@ export class SlackHandler {
       // Only auto-respond in DMs. In channels, require an @mention (handled below).
       const isDM = typeof (message as any).channel === 'string' && (message as any).channel.startsWith('D');
       if (message.subtype === undefined && 'user' in message && isDM) {
+        if (!this.shouldProcessEvent(message, 'dm')) return;
         this.logger.info('Handling direct message (DM) event');
         await this.handleMessage(message as MessageEvent, say);
       }
@@ -789,9 +841,22 @@ export class SlackHandler {
 
     // Handle app mentions
     this.app.event('app_mention', async ({ event, say }) => {
-      this.logger.info('Handling app mention event');
+      if (!this.shouldProcessEvent(event, 'app_mention')) return;
+
       const botId = (event as any).bot_id as string | undefined;
       const rawText = (event as any).text as string | undefined;
+
+      // Only act when this bot is mentioned somewhere in the message text.
+      // (app_mention can also fire on e.g. mentions inside attachments.)
+      const myUserId = await this.getBotUserId();
+      if (myUserId && !this.isAddressedToMe(rawText, myUserId)) {
+        this.logger.info('Mention not in message text, not addressed to me; ignoring', {
+          ts: (event as any).ts,
+        });
+        return;
+      }
+
+      this.logger.info('Handling app mention event');
 
       // Bounded bot-to-bot: inspect inbound for bot-author + hop count. A known
       // agent author counts as a bot even if the event lacks a bot_id (or looks
@@ -819,6 +884,7 @@ export class SlackHandler {
     this.app.event('message', async ({ event, say }) => {
       // Only handle file uploads that are not from bots and have files
       if (event.subtype === 'file_share' && 'user' in event && event.files) {
+        if (!this.shouldProcessEvent(event, 'file_share')) return;
         this.logger.info('Handling file upload event');
         await this.handleMessage(event as MessageEvent, say);
       }
