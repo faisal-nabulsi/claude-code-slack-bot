@@ -46,6 +46,22 @@ export const READONLY_ALLOWED_TOOLS = [
   'mcp__slack__slack_post_message',
   'mcp__slack__slack_reply_to_thread',
   'mcp__slack__slack_add_reaction',
+  // Reading a thread is reading, not mutation — agents kept resorting to top-level
+  // reposts because they couldn't follow threads (the gilbert/sam coordination thrash).
+  'mcp__slack__slack_get_thread_replies',
+  // Read-only Bash: a bot on a read-only turn must be able to DIAGNOSE — read logs,
+  // S3 listings, GPU/process state. That's "read the repo + Slack" per §2, NOT mutation.
+  // Mutating Bash stays blocked: strict mode runs only these; instance-control/merges are
+  // in the hard exclusions; and Write/Edit/rm/push are explicitly denied below.
+  'Bash(aws s3 ls:*)', 'Bash(aws s3api head-object:*)', 'Bash(aws s3api get-object:*)',
+  'Bash(aws s3 cp:*)',   // for reading a log to stdout: aws s3 cp s3://… -
+  'Bash(aws ec2 describe-instances:*)', 'Bash(aws ssm describe-instance-information:*)',
+  'Bash(aws service-quotas get-service-quota:*)',
+  'Bash(aws service-quotas get-requested-service-quota-change:*)',
+  'Bash(nvidia-smi:*)', 'Bash(pgrep:*)', 'Bash(ps:*)', 'Bash(tail:*)', 'Bash(head:*)',
+  'Bash(cat:*)', 'Bash(ls:*)', 'Bash(grep:*)', 'Bash(find:*)', 'Bash(journalctl:*)',
+  'Bash(systemctl status:*)', 'Bash(systemctl is-active:*)',
+  'Bash(git log:*)', 'Bash(git status:*)', 'Bash(git diff:*)', 'Bash(git show:*)',
 ];
 
 // Denied on EVERY bot-initiated turn, even human-rooted ones: starting/stopping
@@ -117,8 +133,12 @@ export function applyReadOnlyForBotTurn(options: any, chain: ChainInfo): any {
   return {
     ...options,
     permissionMode: 'default',            // strict: only listed tools may run
-    allowedTools: READONLY_ALLOWED_TOOLS, // no Write/Edit/Bash/git
-    disallowedTools: ['Write', 'Edit', 'Bash', 'NotebookEdit', ...BOT_TURN_HARD_EXCLUSIONS],
+    allowedTools: READONLY_ALLOWED_TOOLS, // Read/Grep + read Slack + read-only Bash diagnostics
+    // NOTE: 'Bash' is no longer a blanket deny — strict mode already blocks any Bash
+    // NOT in READONLY_ALLOWED_TOOLS (those are read-only). We keep file-edit + the
+    // mutating-Bash escapes (rm/push/s3 rm) explicitly denied as belt-and-suspenders.
+    disallowedTools: ['Write', 'Edit', 'NotebookEdit', ...BOT_TURN_HARD_EXCLUSIONS,
+      'Bash(rm:*)', 'Bash(sudo rm:*)', 'Bash(aws s3 rm:*)', 'Bash(git push:*)'],
   };
 }
 
