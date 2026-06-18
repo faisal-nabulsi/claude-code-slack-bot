@@ -22,6 +22,7 @@ const AGENT_BOTS: Record<string, string> = {
   U0B9X82Q5FX: 'awesome-ash', // L40S training executor (formerly 'trainaws')
   U0B9Y47N1EH: 'sam', // L4 sampling executor
   U0B9L2MEKUP: 'sadie', // L4 sampling executor
+  U0BBLEP299N: 'sage', // L4 sampling executor
 };
 const AGENT_BOT_MENTION_RE = new RegExp(
   `<@[A-Z0-9]+>|@(${Object.values(AGENT_BOTS).join('|')})\\b`,
